@@ -20,7 +20,7 @@
 //     in that modal's didDestroy. So we let it run and close the modal for you, which puts
 //     the rewards through the game's own code path rather than reimplementing them.
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const TAG = `[Auto Sailing v${VERSION}]`;
 const MARK = "auto-sailing";
 
@@ -32,7 +32,6 @@ const LOCK = { LOCKED: 0, UNLOCKED: 1 };
 const LOOT_SIGNATURE = "Sailing Skill XP";
 
 const STORAGE_KEY = "settings";
-const COLLECT_TIMEOUT_MS = 60_000;
 const BACKSTOP_MS = 5_000;
 const DISMISS_POLL_MS = 200;
 
@@ -261,14 +260,15 @@ function collect(sailing, ship) {
 
   const portName = ship.selectedPort?.name ?? "the sea";
 
-  // If the modal never appears or never resolves, don't strand the ship as busy forever.
-  const timeout = setTimeout(() => {
-    if (busy.delete(ship.id)) warn(`collect timed out for ${ship.id}; released`);
-  }, COLLECT_TIMEOUT_MS);
-
   try {
+    // No timeout here, deliberately. collectLoot() rolls the loot immediately but only
+    // banks it when the modal is destroyed, and modals are a *queue* — ours can sit behind
+    // an offline-progress popup, a level-up, a pet drop, for as long as it takes you to
+    // click them. If we released `busy` on a timer the ship would still read HasReturned,
+    // so the next tick would collect again: a second loot roll, a second modal, and both
+    // would eventually grant. Duplicate rewards are far worse than a ship that idles until
+    // you reload, so the ship stays busy until the modal actually resolves.
     ship.collectLoot(() => {
-      clearTimeout(timeout);
       busy.delete(ship.id);
       setStatus(`Collected from ${portName}`);
       // collectLoot() flips the ship back to ReadyToSail and fires its update callbacks
@@ -277,7 +277,6 @@ function collect(sailing, ship) {
       queueTick(ship);
     });
   } catch (err) {
-    clearTimeout(timeout);
     busy.delete(ship.id);
     console.error(`${TAG} collectLoot failed for ${ship.id}`, err);
   }

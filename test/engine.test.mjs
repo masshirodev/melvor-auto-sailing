@@ -29,20 +29,35 @@ globalThis.MutationObserver = class {
 };
 globalThis.TICKS_PER_SECOND = 20;
 
-// ---- fake Swal ------------------------------------------------------------
+// ---- fake Swal + modal queue ----------------------------------------------
+// Melvor really does queue modals (confirmed by dumping addModalToQueue at runtime):
+//   function addModalToQueue(modal) { modalQueue.push(modal); if (!modalQueuePaused) openNextModal(); }
+// So a loot modal can sit behind an offline-progress popup or a level-up for as long as it
+// takes the player to click them. Model that, or the tests can't see the bug it causes.
 let openModal = null;
-const showModal = (modal) => {
-  openModal = modal;
+const modalQueue = [];
+
+const openNextModal = () => {
+  if (openModal || !modalQueue.length) return;
+  openModal = modalQueue.shift();
   setTimeout(() => observers.forEach((cb) => cb()), 0); // the "DOM changed" signal
 };
+const showModal = (modal) => {
+  modalQueue.push(modal);
+  openNextModal();
+};
+const closeModal = () => {
+  const m = openModal;
+  openModal = null;
+  m.didDestroy(); // SweetAlert2 fires didDestroy on close, however it was closed
+  openNextModal();
+};
+const dismissByHand = closeModal; // what the player clicking the popup does
+
 globalThis.Swal = {
   isVisible: () => openModal !== null,
   getPopup: () => (openModal ? { textContent: openModal.text } : null),
-  clickConfirm: () => {
-    const m = openModal;
-    openModal = null;
-    m.didDestroy(); // SweetAlert2 fires didDestroy on close, however it was closed
-  },
+  clickConfirm: closeModal,
 };
 
 // ---- fake Sailing ---------------------------------------------------------
@@ -206,6 +221,44 @@ showModal({ text: "500 Sailing Skill XP", didDestroy: () => {} });
 await settle();
 check("a hand-opened loot modal is left alone", openModal !== null);
 openModal = null;
+
+// ===========================================================================
+// 3b. A loot modal stuck behind another popup must NOT cause a second collect.
+//
+// Melvor queues modals (addModalToQueue -> modalQueue), so ours can sit behind an
+// offline-progress popup or a level-up for as long as it takes you to click them. The ship
+// still reads HasReturned that whole time. If the engine ever re-collected, it would roll a
+// second lot of loot and queue a second modal, and both would eventually grant.
+// ===========================================================================
+let lootRolls = 0;
+const realCollect = ship1.collectLoot.bind(ship1);
+ship1.collectLoot = (cb) => { lootRolls += 1; realCollect(cb); };
+
+// A blocking popup is already up when the ship gets back — it holds the front of the queue.
+showModal({ text: "Offline progress!", didDestroy: () => {} });
+const blocking = openModal;
+ship1.state = STATE.RETURNED;
+ship1.fire();
+await settle();
+check("collect is issued once while a modal blocks the queue", lootRolls === 1,
+  `rolls=${lootRolls}`);
+check("the blocking modal is not dismissed for us", openModal === blocking);
+
+// Sit on it long enough for several backstop ticks (and the old 60s timeout's intent).
+await new Promise((r) => setTimeout(r, 150));
+check("no second collect while the loot modal is still queued", lootRolls === 1,
+  `rolls=${lootRolls}`);
+check("ship is still awaiting collection", ship1.state === STATE.RETURNED,
+  `state=${ship1.state}`);
+
+// The player finally clicks the blocker; ours surfaces and the engine finishes the job.
+dismissByHand();
+await settle();
+check("once the queue clears, the loot modal is collected and the ship re-sails",
+  ship1.state === STATE.ON_TRIP && lootRolls === 1,
+  `state=${ship1.state} rolls=${lootRolls}`);
+check("exactly one loot roll happened in total", lootRolls === 1, `rolls=${lootRolls}`);
+ship1.collectLoot = realCollect;
 
 // ===========================================================================
 // 4. Port strategy.

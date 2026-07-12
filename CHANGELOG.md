@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.1 — Duplicate-loot fix
+
+- **Fixed duplicate loot when the modal queue backs up.** Melvor queues modals
+  (`addModalToQueue` pushes to `modalQueue`), so a loot modal can sit behind an
+  offline-progress popup, a level-up or a pet drop for as long as it takes you to click them.
+  `collect()` used to release its `busy` flag on a 60s timeout — but the ship still reads
+  `HasReturned` until the modal is destroyed, so the next tick collected *again*: a second loot
+  roll, a second queued modal, and both would eventually grant. This bites hardest in exactly
+  the case the mod exists for — loading in after hours away, with four ships returning into a
+  backed-up queue.
+
+  The timeout is gone. `busy` is now cleared only by the modal's own callback, so a ship stays
+  flagged until its loot actually lands. A ship stranded by a modal that never resolves is
+  fixed by a reload; duplicated rewards are not.
+
+- The test harness now models the modal **queue** rather than a single popup, which is what
+  made the bug visible.
+
 ## 0.1.0 — Initial release
 
 Automates the Sailing mod's trade loop: collect on return, re-dispatch immediately, and
