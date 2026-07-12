@@ -19,6 +19,8 @@ and can keep each ship pointed at the best port for whatever you're going for.
 | **Automation enabled** | off | Master switch. |
 | **Auto set sail** | on | Re-dispatches any idle, unlocked ship. |
 | **Auto collect loot** | on | Collects the moment a ship returns, closing the loot modal for you. |
+| **Offline catch-up** | **off** | Replays the voyages your ships missed while the game was closed. |
+| **Catch-up at most** | 24h | How much of an absence catch-up will credit. |
 | **Auto upgrade tier** | **off** | Buys the next ship tier when affordable. **Spends up to 100M GP + materials.** |
 | **Auto buy ships** | **off** | Buys locked ships when affordable. **Spends up to 50M GP.** |
 
@@ -50,7 +52,7 @@ that in (expected value carries a factor of `0.5 + 0.5 × chance`); **Safe** ref
 
 ## Install
 
-**From a modfile:** install `auto-sailing.zip` (contains `manifest.json` + `setup.mjs` at the
+**From a modfile:** install `auto-sailing-v<version>.zip` (contains `manifest.json` + `setup.mjs` at the
 archive root).
 
 **As a local mod:** create a local mod in the Melvor Mod Manager and point it at the `mod/`
@@ -68,8 +70,10 @@ Then enable it, along with the Sailing mod, and load a character.
 ## Development notes
 
 Everything lives in one file, `mod/setup.mjs`. The Sailing mod ships minified, so most of what
-follows was recovered by reading it and confirmed with `probes/probe1.js` — probe before you
-trust any of it.
+follows was originally recovered by reading the bundle and confirmed with `probes/probe1.js`.
+Its source is public — <https://github.com/adamk33n3r/melvor-sailing> — and is the better
+reference now (`src/ts/ship.ts`, `src/ts/sailing.ts`); still probe before you trust anything about
+the *live* object graph.
 
 Things worth knowing before changing this:
 
@@ -100,6 +104,13 @@ Things worth knowing before changing this:
   cosmetic and can be bypassed entirely.
 - `game.sailing.page.update()` redraws the Sailing UI, so none of the `renderQueue` gymnastics
   other Melvor mods need apply here.
+- **Offline catch-up takes the sail timers off the game.** It snapshots the away time in
+  `onCharacterLoaded` — the last moment `game.tickTimestamp` still holds the previous session's
+  final tick — and calls `sailTimer.stop()` on the ships it's going to replay. A stopped `Timer`
+  ignores `tick()`, so the game's offline loop can't advance a voyage the mod is already
+  accounting for; without that the two would double-count the same hours. The ships are marked
+  `busy` for the duration, which is what keeps the engine's own loop off them, and `runCatchUp()`
+  always hands them back.
 - The `probes/` directory holds console scripts used to reverse-engineer the skill's object
   graph at runtime. Paste them into the browser console (Melvor makes you type `allow pasting`
   once first).
@@ -107,7 +118,7 @@ Things worth knowing before changing this:
 ## Build
 
 ```sh
-./build.sh              # syntax-check, run tests, package auto-sailing.zip
+./build.sh              # syntax-check, run tests, package auto-sailing-v<version>.zip
 ./build.sh --skip-tests
 ```
 
@@ -122,13 +133,36 @@ node test/engine.test.mjs
 ```
 
 Drives the real `mod/setup.mjs` against a fake Sailing skill that reproduces the mod's actual
-semantics — including the `didDestroy`-only reward grant and the callbacks-before-callback
-ordering above. Covers the collect → re-sail loop, modal-dismisser scoping, the port strategies,
-and the spending guards. No game required.
+semantics — including the `didDestroy`-only reward grant, the callbacks-before-callback ordering
+above, and a `Timer` that ignores ticks once stopped. Covers the collect → re-sail loop,
+modal-dismisser scoping, the port strategies, the spending guards, and offline catch-up (voyage
+accounting, the cap, and the ships it must refuse to credit). No game required.
 
-## Known limits
+## Offline catch-up
 
-While the game is **closed** the mod isn't running, so a ship that returns three hours into an
-eight-hour absence still just waits. On load it's collected and re-sailed immediately, but the
-voyages that "would have" happened aren't simulated — that would be fabricating rewards rather
-than automating clicks.
+Sailing is a `PassiveAction`: its `passiveTick()` ticks every ship's `sailTimer`, and Melvor runs
+that same tick loop over the time you were away. So the voyage a ship was on **does** finish while
+the game is closed. What never happens is the collect and the re-dispatch — those are clicks — so
+the ship gets home three hours into an eight-hour absence and then sits there for five hours.
+
+The clicks are the only thing missing, so they're the only thing this replays. For each voyage that
+would have fitted in your absence, the mod calls the game's own `collectLoot()`: the loot rolls, the
+pirate check, the XP, the mastery, the pets and the ancient relics are all decided by Sailing's code,
+not ours. No rewards are fabricated — the mod supplies the clicks it owed you.
+
+**It's off by default, and it's a real power increase**, not just a convenience: an eight-hour night
+goes from one voyage to eight, with eight independent pet and relic rolls. Turn it on deliberately.
+The cap bounds how much of an absence gets credited (and the game's own 24-hour offline ceiling
+bounds it regardless of what you set).
+
+Two things it deliberately doesn't do:
+
+- **It replays each ship from the port it sailed from.** A strategy that would have re-pointed the
+  ship mid-absence — say, after an offline level-up opened a better port — doesn't get to. That
+  under-credits rather than over-credits, which is the right way to be wrong.
+- **It won't credit a ship that was sitting in port when you quit**, unless the loop was actually
+  switched on for it. Catch-up replays a loop that was running; it doesn't start one retroactively.
+
+Every replayed voyage opens the game's real loot modal, which the mod closes for you (that's what
+banks the rewards — see below). They're collected strictly one at a time, so they queue politely
+behind Melvor's own offline-progress popup rather than racing it.

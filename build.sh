@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Packages the mod into auto-sailing.zip for upload to mod.io / the Mod Manager.
+# Packages the mod into auto-sailing-v<version>.zip for upload to mod.io / the Mod Manager.
 #
 # The one thing that actually matters here: manifest.json and setup.mjs must sit at the
 # ROOT of the archive, not inside a mod/ folder. Melvor installs and enables a wrongly
@@ -10,7 +10,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-OUT="auto-sailing.zip"
 FILES=(mod/manifest.json mod/setup.mjs)
 
 for f in "${FILES[@]}"; do
@@ -26,6 +25,7 @@ if [[ "${1:-}" != "--skip-tests" ]]; then
 fi
 
 VERSION=$(node -pe 'require("./mod/manifest.json").version')
+OUT="auto-sailing-v$VERSION.zip"
 
 rm -f "$OUT"
 zip -j -q "$OUT" "${FILES[@]}"

@@ -87,6 +87,15 @@ const ports = [
   mkPort("kingsLanding", 1320, 15000),
 ];
 
+// Melvor's Timer: ticksLeft is a getter, stop() parks it, and a parked timer ignores ticks —
+// which is what lets the mod take a voyage off the game's hands during offline catch-up.
+class FakeTimer {
+  constructor() { this.ticksLeft = 0; this.active = false; }
+  get isActive() { return this.active; }
+  start(ms) { this.ticksLeft = Math.round((ms / 1000) * TICKS_PER_SECOND); this.active = true; }
+  stop() { this.ticksLeft = 0; this.active = false; }
+}
+
 class Ship {
   constructor(localID, dockLevel, unlockCost) {
     this.localID = localID;
@@ -96,20 +105,21 @@ class Ship {
     this.lockState = LOCK.LOCKED;
     this.selectedPort = ports[0];
     this.currentUpgrade = { localID: "Cutter", name: "Cutter", level: 1 };
-    this.sailTimer = { ticksLeft: 0 };
+    this.sailTimer = new FakeTimer();
     this.dock = { level: dockLevel, getUnlockCosts: () => mkCosts(unlockCost) };
     this.cbs = [];
     this.sailCount = 0;
+    this.lootRolls = 0;
   }
   registerOnUpdate(fn) { this.cbs.push(fn); }
   fire() { this.cbs.forEach((f) => f()); }
   setSail() {
     this.state = STATE.ON_TRIP;
-    this.sailTimer.ticksLeft = 100;
+    this.sailTimer.start(this.selectedPort.interval);
     this.sailCount += 1;
     this.fire();
   }
-  arrive() { this.state = STATE.RETURNED; this.sailTimer.ticksLeft = 0; this.fire(); }
+  arrive() { this.state = STATE.RETURNED; this.sailTimer.stop(); this.fire(); }
   getNextUpgrade() {
     return this.currentUpgrade.localID === "Cutter"
       ? { localID: "Frigate", name: "Frigate", level: 40 } : undefined;
@@ -119,6 +129,7 @@ class Ship {
   // Faithful to the real one: opens a modal, and only on destroy does it reset state,
   // fire callbacks, and THEN invoke the caller's callback.
   collectLoot(cb) {
+    this.lootRolls += 1;
     showModal({
       text: "1000 Sailing Skill XP ... loot ...",
       didDestroy: () => {
@@ -385,6 +396,172 @@ check("a JSON-string payload is parsed, not spread into garbage",
   globalThis.autoSailing.settings.strategy === "safe" &&
     globalThis.autoSailing.settings.enabled === true,
   `strategy=${globalThis.autoSailing.settings.strategy}`);
+
+// ===========================================================================
+// 7. Offline catch-up.
+//
+// Sailing's passiveTick() ticks the sail timers, and Melvor runs that loop over offline time
+// too — so the voyage a ship was on really does finish while the game is closed. What never
+// happens is the collect and the re-dispatch, so the ship parks there for the rest of your
+// absence. Catch-up replays those missed voyages through the game's own collectLoot(), which
+// is what rolls the loot; the mod only supplies the clicks.
+// ===========================================================================
+const HOUR = 3_600_000;
+
+// A whole fresh world per case: catch-up only runs once, at character load.
+let bootCount = 0;
+async function bootOffline({ awayMs, ships: shipSpecs, ...overrides }) {
+  const world = shipSpecs.map((spec, i) => {
+    const ship = new Ship(`Offline${bootCount}_${i}`, 1, 0);
+    ship.lockState = spec.lock ?? LOCK.UNLOCKED;
+    ship.state = spec.state;
+    ship.selectedPort = ports[0]; // tinyIsland: a 1h round trip
+    if (spec.state === STATE.ON_TRIP) {
+      ship.sailTimer.start(spec.atSeaMs);
+      ship.sailCount = 0; // the voyage it left on doesn't count as one we dispatched
+    }
+    return ship;
+  });
+
+  const offlineSailing = {
+    id: "sailing:Sailing",
+    level: 99,
+    ships: registry(world),
+    ports: registry(ports),
+    page: { update() {} },
+    modifyXP: (xp) => xp,
+    modifyInterval: (i) => i,
+    getCombatModifier: () => 999999,
+  };
+
+  globalThis.game = {
+    sailing: offlineSailing,
+    scheduleSave() {},
+    MAX_OFFLINE_TIME: 86_400_000,
+    tickTimestamp: Date.now() - awayMs, // the last tick of the previous session
+  };
+
+  const offlineStore = new Map([[
+    "settings",
+    {
+      enabled: true, autoSail: true, autoCollect: true,
+      autoUpgrade: false, autoBuy: false,
+      offlineCatchup: true, offlineCapHours: 24,
+      strategy: "manual", ships: {},
+      ...overrides,
+    },
+  ]]);
+
+  bootCount += 1;
+  const mod = await import(`../mod/setup.mjs?offline=${bootCount}`);
+  let onChar, onIface;
+  mod.setup({
+    settings: { section: () => ({ add() {}, set() {} }) },
+    characterStorage: {
+      getItem: (k) => offlineStore.get(k),
+      setItem: (k, v) => offlineStore.set(k, v),
+    },
+    onCharacterLoaded: (f) => (onChar = f),
+    onInterfaceReady: (f) => (onIface = f),
+  });
+  onChar();
+  onIface();
+  await new Promise((r) => setTimeout(r, 200)); // let the replay drain the modal queue
+  return world;
+}
+
+// Away 8h, ship 10 minutes from home. It gets back (1), then runs 7 more full hours:
+// 8 voyages, and it should be 10 minutes into the ninth.
+{
+  const [ship] = await bootOffline({
+    awayMs: 8 * HOUR,
+    ships: [{ state: STATE.ON_TRIP, atSeaMs: 10 * 60_000 }],
+  });
+  check("catch-up collects every voyage the absence had room for",
+    ship.lootRolls === 8, `rolls=${ship.lootRolls}`);
+  check("the ship ends the catch-up back at sea",
+    ship.state === STATE.ON_TRIP && ship.sailTimer.isActive,
+    `state=${ship.state} active=${ship.sailTimer.isActive}`);
+  check("its voyage resumes part-finished, not from scratch",
+    ship.sailTimer.ticksLeft === 10 * 60 * TICKS_PER_SECOND,
+    `ticksLeft=${ship.sailTimer.ticksLeft}`);
+  check("no loot modal is left on screen", openModal === null);
+}
+
+// The cap is the whole safety story: it must bound the loot, not just the clock.
+{
+  const [ship] = await bootOffline({
+    awayMs: 8 * HOUR,
+    offlineCapHours: 2,
+    ships: [{ state: STATE.ON_TRIP, atSeaMs: 10 * 60_000 }],
+  });
+  check("the cap limits how much of an absence is credited",
+    ship.lootRolls === 2, `rolls=${ship.lootRolls}`);
+}
+
+// Off by default — the same rule the spending toggles follow.
+{
+  const [ship] = await bootOffline({
+    awayMs: 8 * HOUR,
+    offlineCatchup: false,
+    ships: [{ state: STATE.ON_TRIP, atSeaMs: 10 * 60_000 }],
+  });
+  check("catch-up does nothing unless you ask for it", ship.lootRolls === 0,
+    `rolls=${ship.lootRolls}`);
+}
+
+// A ship that never got out of port shouldn't come home rich.
+{
+  const [sailed, locked] = await bootOffline({
+    awayMs: 8 * HOUR,
+    ships: [
+      { state: STATE.ON_TRIP, atSeaMs: 10 * 60_000 },
+      { state: STATE.READY, lock: LOCK.LOCKED },
+    ],
+  });
+  check("a ship you don't own is not caught up", locked.lootRolls === 0,
+    `rolls=${locked.lootRolls}`);
+  check("owning one ship doesn't stop the others catching up", sailed.lootRolls === 8,
+    `rolls=${sailed.lootRolls}`);
+}
+
+// Loot the ship was already holding when you quit is collected, and it doesn't get counted as
+// part of the absence: 1 pending + 8 full hours away.
+{
+  const [ship] = await bootOffline({
+    awayMs: 8 * HOUR,
+    ships: [{ state: STATE.RETURNED }],
+  });
+  check("uncollected loot is banked, then the absence is replayed on top",
+    ship.lootRolls === 9, `rolls=${ship.lootRolls}`);
+}
+
+// Home before the voyage was up: no loot, and the ship must be put back exactly where the
+// game's own offline ticks would have left it — 2 hours in, 1 hour still to run.
+{
+  const [ship] = await bootOffline({
+    awayMs: 2 * HOUR,
+    ships: [{ state: STATE.ON_TRIP, atSeaMs: 3 * HOUR }],
+  });
+  check("an unfinished voyage grants nothing", ship.lootRolls === 0,
+    `rolls=${ship.lootRolls}`);
+  check("an unfinished voyage keeps the time it had already served",
+    ship.state === STATE.ON_TRIP && ship.sailTimer.ticksLeft === 1 * 60 * 60 * TICKS_PER_SECOND,
+    `ticksLeft=${ship.sailTimer.ticksLeft}`);
+}
+
+// A minute's absence is beneath the game's own offline threshold, and beneath ours.
+{
+  const [ship] = await bootOffline({
+    awayMs: 30_000,
+    ships: [{ state: STATE.ON_TRIP, atSeaMs: 10 * 60_000 }],
+  });
+  check("a trivial absence is not treated as offline time", ship.lootRolls === 0,
+    `rolls=${ship.lootRolls}`);
+  check("and the ship is left sailing as it was",
+    ship.state === STATE.ON_TRIP && ship.sailTimer.isActive,
+    `state=${ship.state} active=${ship.sailTimer.isActive}`);
+}
 
 // ===========================================================================
 console.log("");

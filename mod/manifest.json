@@ -1,7 +1,7 @@
 {
   "name": "Auto Sailing",
-  "description": "Automates the Sailing skill: collects loot the moment a ship returns, immediately re-dispatches it, and can keep each ship pointed at the best port for your goal (level up, best XP rate, or safest). Optional auto-buy and auto-upgrade for ships, off by default. Requires the Sailing mod.",
-  "version": "0.1.3",
+  "description": "Automates the Sailing skill: collects loot the moment a ship returns, immediately re-dispatches it, and can keep each ship pointed at the best port for your goal (level up, best XP rate, or safest). Optional offline catch-up replays the voyages you missed while the game was closed. Optional auto-buy and auto-upgrade for ships, off by default. Requires the Sailing mod.",
+  "version": "0.2.0",
   "setup": "setup.mjs",
   "load": [],
   "resources": []

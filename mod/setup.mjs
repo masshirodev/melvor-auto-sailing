@@ -11,6 +11,8 @@
 //   Ship.setSail() / collectLoot(cb) / upgrade() / getUpgradeCosts() / getNextUpgrade()
 //   Ship.registerOnUpdate(fn)     -> fires on every ship state change; our event hook
 //   Ship.dock.getUnlockCosts()
+//   Ship.sailTimer                -> Timer, ticked by Sailing.passiveTick(); Melvor runs that
+//                                    same tick loop over offline time (see catch-up, below)
 //
 // Two things the Sailing mod does NOT do for us, so we do them here:
 //   * setSail(), upgrade() and the lockState setter have NO guards — they neither check
@@ -20,7 +22,7 @@
 //     in that modal's didDestroy. So we let it run and close the modal for you, which puts
 //     the rewards through the game's own code path rather than reimplementing them.
 
-const VERSION = "0.1.3";
+const VERSION = "0.2.0";
 const TAG = `[Auto Sailing v${VERSION}]`;
 const MARK = "auto-sailing";
 
@@ -36,6 +38,15 @@ const STORAGE_LIMIT = 8192; // Melvor's per-mod character-storage cap
 const BACKSTOP_MS = 5_000;
 const DISMISS_POLL_MS = 200;
 
+// Offline catch-up. The game refuses to process an absence shorter than a minute or longer
+// than a day (Game.MIN_OFFLINE_TIME / MAX_OFFLINE_TIME), and we hold to the same window.
+const MIN_CATCHUP_MS = 60_000;
+const DEFAULT_MAX_OFFLINE_MS = 86_400_000;
+// A day at the shortest possible trip can't come near this. It's here so that a nonsense
+// interval (a modifier bug, a port with interval 0 slipping through) can't spin forever.
+const CATCHUP_MAX_VOYAGES = 500;
+const CATCHUP_CAP_CHOICES = [1, 2, 4, 8, 12, 24];
+
 const STRATEGIES = {
   manual: "Manual (leave port alone)",
   levelup: "Level up (highest port)",
@@ -50,6 +61,8 @@ const DEFAULTS = {
   autoCollect: true,
   autoUpgrade: false,
   autoBuy: false,
+  offlineCatchup: false,
+  offlineCapHours: 24,
   strategy: "manual",
   ships: {}, // localID -> { enabled, strategy: "inherit"|<mode>, pinnedPort: <port id|null> }
 
@@ -412,6 +425,181 @@ function tryUpgrade(sailing, ship) {
 }
 
 // ---------------------------------------------------------------------------
+// Offline catch-up
+//
+// Sailing is a PassiveAction: its passiveTick() ticks every ship's sailTimer, and Melvor runs
+// that same tick loop over the time you were away (Game.MIN/MAX_OFFLINE_TIME, i.e. a minute to
+// a day). So a voyage that was in flight when you closed the game really does finish while
+// you're gone — the ship just parks at HasReturned forever, because collecting and
+// re-dispatching are clicks and nobody was here to click them.
+//
+// The clicks are therefore the only thing missing, and the only thing we replay. For every
+// voyage that would have fitted in the away window we call the game's own collectLoot(), so the
+// loot rolls, the pirate check, the XP, the mastery, the pets and the relics are all decided by
+// Sailing's code. We invent no rewards; we supply the clicks that were owed.
+//
+// The one liberty taken: the ship replays every voyage from the port it sailed from. A strategy
+// that would have re-pointed it mid-absence (say, after an offline level-up opened a better
+// port) doesn't get to. That under-credits rather than over-credits, which is the right way to
+// be wrong.
+// ---------------------------------------------------------------------------
+
+// Captured at character load, before the game's offline loop has run. Null when there's
+// nothing to catch up, which is the common case and the safe one.
+let pendingCatchUp = null;
+
+function ticksToMs(ticks) {
+  return (ticks / ticksPerSecond()) * 1000;
+}
+
+function maxOfflineMs() {
+  return getGame()?.MAX_OFFLINE_TIME ?? DEFAULT_MAX_OFFLINE_MS;
+}
+
+// Timer.ticksLeft is a getter over _ticksLeft, so resuming a part-finished voyage means
+// starting the timer and then writing the remainder behind it.
+function setTimerRemaining(timer, ms) {
+  if (!timer) return;
+  const ticks = Math.max(1, Math.round((ms / 1000) * ticksPerSecond()));
+  if ("_ticksLeft" in timer) timer._ticksLeft = ticks;
+  else timer.ticksLeft = ticks;
+}
+
+function tripMs(sailing, ship) {
+  const port = ship.selectedPort;
+  if (!port) return 0;
+  return sailing.modifyInterval(port.interval, ship.dock);
+}
+
+// A ship only catches up if the loop we're replaying is one it was actually running: it has to
+// be bought, switched on, and both halves of the loop have to be enabled.
+function catchUpEligible(ship) {
+  if (ship.lockState !== LOCK.UNLOCKED) return false;
+  if (!shipConfig(ship).enabled) return false;
+  return settings.autoSail && settings.autoCollect;
+}
+
+// Runs at character load, BEFORE the game's offline loop. Two jobs: read the away time while
+// game.tickTimestamp still holds the last tick of the previous session, and take the eligible
+// ships' timers off the game's hands, so its offline ticks can't advance a voyage we're about
+// to account for ourselves. Marking them busy stops the engine touching them in the meantime;
+// runCatchUp() always hands them back.
+function snapshotForCatchUp() {
+  pendingCatchUp = null;
+  if (!settings.enabled || !settings.offlineCatchup) return;
+
+  const game = getGame();
+  const sailing = game?.sailing;
+  if (!sailing) return;
+
+  const lastTick = game.tickTimestamp || game.previousTickTime || 0;
+  if (!lastTick) return;
+
+  const awayMs = Date.now() - lastTick;
+  if (!(awayMs >= MIN_CATCHUP_MS)) return;
+
+  const capMs = Math.min(maxOfflineMs(), Math.max(0, settings.offlineCapHours) * 3_600_000);
+  const creditedMs = Math.min(awayMs, capMs);
+  if (!(creditedMs >= MIN_CATCHUP_MS)) return;
+
+  const ships = new Map();
+  sailing.ships.forEach((ship) => {
+    if (!catchUpEligible(ship)) return;
+    ships.set(ship.id, { state: ship.state, ticksLeft: ship.sailTimer?.ticksLeft ?? 0 });
+    busy.add(ship.id);
+    ship.sailTimer?.stop?.();
+  });
+  if (!ships.size) return;
+
+  pendingCatchUp = { awayMs, creditedMs, ships };
+  log(
+    `away for ${formatEta(awayMs)}, crediting ${formatEta(creditedMs)} to ${ships.size} ship(s)`,
+  );
+}
+
+// How many voyages the ship would have finished, and where it should be standing when we're
+// done. `pending` is loot the ship was already holding when you quit — it isn't part of the
+// absence, but it does have to be collected before the ship can sail again.
+function planCatchUp(sailing, ship, snap, awayMs) {
+  const trip = tripMs(sailing, ship);
+  if (!(trip > 0)) return null;
+
+  const pending = snap.state === STATE.RETURNED ? 1 : 0;
+  const atSeaMs = snap.state === STATE.ON_TRIP ? ticksToMs(snap.ticksLeft) : 0;
+
+  // Didn't even finish the voyage it was on: no loot, just put it back where the game's own
+  // offline ticks would have left it.
+  if (awayMs < atSeaMs) {
+    return { collects: pending, remainingMs: atSeaMs - awayMs };
+  }
+
+  const spare = awayMs - atSeaMs;
+  const completed = (snap.state === STATE.ON_TRIP ? 1 : 0) + Math.floor(spare / trip);
+
+  return {
+    collects: Math.min(pending + completed, CATCHUP_MAX_VOYAGES),
+    remainingMs: trip - (spare % trip),
+  };
+}
+
+function collectOnce(ship) {
+  return new Promise((resolve, reject) => {
+    try {
+      ship.collectLoot(resolve);
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function runCatchUp(sailing) {
+  const snapshot = pendingCatchUp;
+  pendingCatchUp = null;
+  if (!snapshot) return;
+
+  let collected = 0;
+
+  for (const ship of sailing.ships.allObjects) {
+    const snap = snapshot.ships.get(ship.id);
+    if (!snap) continue;
+
+    try {
+      const plan = planCatchUp(sailing, ship, snap, snapshot.creditedMs);
+      if (!plan) continue;
+
+      for (let i = 0; i < plan.collects; i += 1) {
+        // Strictly one at a time. Each collect opens a loot modal, the rewards are only
+        // banked when it's destroyed, and Melvor opens modals one at a time anyway — so
+        // firing them off in parallel would just pile up a queue and roll loot for a ship
+        // whose previous roll hadn't landed yet. Awaiting each one also means our modals
+        // sit politely behind the game's own offline-progress popup until you dismiss it.
+        setStatus(`Catching up ${ship.name}: voyage ${i + 1} of ${plan.collects}`);
+        await collectOnce(ship);
+        collected += 1;
+      }
+
+      ship.setSail();
+      setTimerRemaining(ship.sailTimer, plan.remainingMs);
+    } catch (err) {
+      console.error(`${TAG} offline catch-up failed for ${ship.id}`, err);
+    } finally {
+      busy.delete(ship.id);
+      // Whatever happened above, the ship must not be left at sea holding the timer we
+      // stopped — that's a voyage that can never end. Start it over rather than strand it.
+      if (ship.state === STATE.ON_TRIP && ship.sailTimer?.isActive === false) ship.setSail();
+      queueTick(ship);
+    }
+  }
+
+  sailing.page?.update?.();
+  setStatus(
+    collected
+      ? `Offline catch-up: ${collected} voyage${collected === 1 ? "" : "s"} over ${formatEta(snapshot.creditedMs)}`
+      : "idle",
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Loot-modal dismisser
 //
 // generateLoot() commits rewards in the modal's didDestroy, not in its confirm handler,
@@ -511,6 +699,29 @@ function checkbox(key, label, hint) {
   return wrap;
 }
 
+// How much of an absence catch-up is allowed to credit. The game itself never credits more
+// than a day, so neither can we, whatever this says.
+function capSelect() {
+  const wrap = document.createElement("label");
+  wrap.textContent = "Catch-up at most: ";
+  const select = document.createElement("select");
+  select.className = "form-control form-control-sm";
+  for (const hours of CATCHUP_CAP_CHOICES) {
+    const option = document.createElement("option");
+    option.value = String(hours);
+    option.textContent = hours === 1 ? "1 hour" : `${hours} hours`;
+    select.append(option);
+  }
+  select.value = String(settings.offlineCapHours);
+  select.addEventListener("change", () => {
+    settings.offlineCapHours = Number(select.value);
+    saveSettings();
+    updatePanel();
+  });
+  wrap.append(select);
+  return wrap;
+}
+
 function strategySelect(value, { includeInherit } = {}) {
   const select = document.createElement("select");
   select.className = "form-control form-control-sm";
@@ -552,6 +763,8 @@ function buildPanel(sailing) {
     checkbox("autoCollect", "Auto collect loot"),
     checkbox("autoUpgrade", "Auto upgrade tier", "(spends up to 100M GP + materials)"),
     checkbox("autoBuy", "Auto buy ships", "(spends up to 50M GP)"),
+    checkbox("offlineCatchup", "Offline catch-up", "(replays voyages missed while closed)"),
+    capSelect(),
   );
 
   const strategyWrap = document.createElement("label");
@@ -731,6 +944,11 @@ export function setup(ctx) {
     storage = loadedCtx?.characterStorage ?? storage;
     loadSettings();
     checkStorage();
+
+    // Must happen here, not in onInterfaceReady: game.tickTimestamp still holds the last tick
+    // of the previous session, and the game's offline loop hasn't run yet.
+    snapshotForCatchUp();
+
     updatePanel();
   });
 
@@ -778,6 +996,10 @@ export function setup(ctx) {
     mountPanel(sailing);
     tickAll();
     setInterval(tickAll, BACKSTOP_MS);
+
+    // Ships with a catch-up pending are already marked busy, so the sweep above left them
+    // alone. This replays what they missed and hands them back to the engine.
+    runCatchUp(sailing);
 
     log(`Loaded. ${sailing.ships.size} ships, ${sailing.ports.size} ports.`);
   });
