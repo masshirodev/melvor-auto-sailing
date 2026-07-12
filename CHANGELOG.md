@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.2 — Settings now actually persist
+
+- **Fixed settings not surviving a restart.** `characterStorage` is only written into the save
+  file when the game next saves, so changing a setting and then reloading (or closing the tab)
+  before the next autosave simply lost it. `saveSettings()` now calls `game.scheduleSave()`.
+- **Fixed saves silently doing nothing.** The storage handle was only assigned inside
+  `onCharacterLoaded`, and every write went through `storage?.setItem?.(...)` — optional
+  chaining, so if that hook hadn't run (a mod reloaded into an already-running game, say)
+  every save no-opped without a word. The handle is now taken at setup, settings are loaded on
+  interface-ready if the hook never fired, and a missing storage handle warns loudly instead of
+  failing quietly.
+- `getItem` returning a JSON **string** is now parsed rather than spread — spreading a string
+  yields an object with numeric keys and leaves every real setting at its default, which looks
+  identical to "my settings didn't save".
+- Added a console handle for diagnosing this: `autoSailing.dump()`, `.save()`, `.reset()`.
+
 ## 0.1.1 — Duplicate-loot fix
 
 - **Fixed duplicate loot when the modal queue backs up.** Melvor queues modals

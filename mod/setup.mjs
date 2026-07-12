@@ -20,7 +20,7 @@
 //     in that modal's didDestroy. So we let it run and close the modal for you, which puts
 //     the rewards through the game's own code path rather than reimplementing them.
 
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 const TAG = `[Auto Sailing v${VERSION}]`;
 const MARK = "auto-sailing";
 
@@ -55,6 +55,7 @@ const DEFAULTS = {
 
 let settings = structuredClone(DEFAULTS);
 let storage = null; // ctx.characterStorage
+let settingsLoaded = false;
 let lastStatus = "idle";
 
 // Ships mid-collect: added before we call collectLoot(), removed when its callback fires
@@ -100,17 +101,43 @@ const warn = (...args) => console.warn(TAG, ...args);
 // ---------------------------------------------------------------------------
 
 function loadSettings() {
+  if (!storage) {
+    warn("no characterStorage; settings will not persist this session");
+    return;
+  }
   try {
-    const saved = storage?.getItem?.(STORAGE_KEY);
-    if (saved) settings = { ...structuredClone(DEFAULTS), ...saved, ships: saved.ships ?? {} };
+    let saved = storage.getItem(STORAGE_KEY);
+    // Tolerate a JSON string as well as an object — spreading a string would otherwise
+    // silently produce a garbage object with numeric keys and leave every real setting
+    // sitting at its default, which looks exactly like "settings didn't save".
+    if (typeof saved === "string") saved = JSON.parse(saved);
+    if (!saved || typeof saved !== "object") {
+      log("no saved settings for this character; using defaults");
+      settingsLoaded = true;
+      return;
+    }
+    settings = { ...structuredClone(DEFAULTS), ...saved, ships: saved.ships ?? {} };
+    settingsLoaded = true;
+    log("settings loaded", settings);
   } catch (err) {
     warn("could not load settings, using defaults", err);
   }
 }
 
 function saveSettings() {
+  if (!storage) {
+    warn("cannot save settings: no characterStorage (is a character loaded?)");
+    return;
+  }
   try {
-    storage?.setItem?.(STORAGE_KEY, settings);
+    // Round-trip through JSON so we can never hand characterStorage something
+    // unserialisable, and so what we store is exactly what we'll read back.
+    storage.setItem(STORAGE_KEY, JSON.parse(JSON.stringify(settings)));
+
+    // characterStorage is only written into the save file when the game next saves. Without
+    // this, changing a setting and then reloading (or closing the tab) before the next
+    // autosave loses it — which is the whole "my settings don't persist" symptom.
+    getGame()?.scheduleSave?.();
   } catch (err) {
     warn("could not save settings", err);
   }
@@ -661,10 +688,16 @@ function syncSettingsSection() {
 // ---------------------------------------------------------------------------
 
 export function setup(ctx) {
+  // Grab the storage handle now, not inside onCharacterLoaded. The object exists from
+  // setup; only its *contents* need a loaded character. Deferring the assignment meant that
+  // if that hook didn't fire (a mod reloaded into an already-running game, say), every save
+  // silently no-opped.
+  storage = ctx.characterStorage ?? null;
+  if (!storage) warn("ctx.characterStorage is unavailable; settings will not persist");
+
   registerSettings(ctx);
 
   ctx.onCharacterLoaded(() => {
-    storage = ctx.characterStorage;
     loadSettings();
     syncSettingsSection();
   });
@@ -676,8 +709,24 @@ export function setup(ctx) {
       return;
     }
 
+    // A mod reloaded into a running game misses onCharacterLoaded, so settings would still
+    // be at their defaults here. Load them if that hook never ran.
+    if (!settingsLoaded) {
+      loadSettings();
+      syncSettingsSection();
+    }
+
     injectStyles();
     installModalDismisser();
+
+    // Console handle for debugging persistence: autoSailing.dump() / .save() / .reset()
+    globalThis.autoSailing = {
+      get settings() { return settings; },
+      stored: () => storage?.getItem?.(STORAGE_KEY),
+      save: () => saveSettings(),
+      dump() { console.log({ live: settings, stored: this.stored(), hasStorage: !!storage }); },
+      reset() { settings = structuredClone(DEFAULTS); saveSettings(); updatePanel(); },
+    };
 
     // The Sailing mod fires these on every ship state change, including onReturn(), so the
     // engine is event-driven. A ship can already be HasReturned from offline progress

@@ -151,7 +151,8 @@ const sailing = {
   getCombatModifier: () => combatStat,
 };
 let combatStat = 100;
-globalThis.game = { sailing };
+let saveCount = 0;
+globalThis.game = { sailing, scheduleSave: () => { saveCount += 1; } };
 
 // ---- fake mod ctx ---------------------------------------------------------
 const store = new Map();
@@ -329,6 +330,61 @@ await settle();
 check("auto-upgrade upgrades once level and cost are met",
   ship1.currentUpgrade.localID === "Frigate" && gp === 4_000_000,
   `tier=${ship1.currentUpgrade.localID} gp=${gp}`);
+
+// ===========================================================================
+// 6. Persistence across a game restart.
+//
+// characterStorage only reaches the save file when the game next saves, so saveSettings()
+// must also ask the game to save — otherwise a toggle followed by a reload is lost.
+// ===========================================================================
+// Go through the mod's real save path (what every panel control calls), not the harness's
+// shortcut of writing to the store directly.
+store.delete("settings");
+saveCount = 0;
+globalThis.autoSailing.settings.strategy = "safe";
+globalThis.autoSailing.save();
+
+check("saving a setting schedules a game save", saveCount > 0, `saves=${saveCount}`);
+
+const storedNow = store.get("settings");
+check("settings were actually written to characterStorage", !!storedNow);
+check("the stored value round-trips as a plain object", typeof storedNow === "object");
+check("the stored value holds what we set", storedNow?.strategy === "safe",
+  `strategy=${storedNow?.strategy}`);
+conf.strategy = "safe"; // keep the harness's expectation in step with what we just saved
+
+const fresh = await import("../mod/setup.mjs?restart=1");
+let freshCharLoaded, freshIfaceReady;
+fresh.setup({
+  settings: { section: () => ({ add() {}, set() {} }) },
+  characterStorage: ctx.characterStorage,
+  onCharacterLoaded: (f) => (freshCharLoaded = f),
+  onInterfaceReady: (f) => (freshIfaceReady = f),
+});
+freshCharLoaded();
+freshIfaceReady();
+check("a restarted mod reads its settings back",
+  globalThis.autoSailing.settings.enabled === true &&
+    globalThis.autoSailing.settings.strategy === conf.strategy,
+  `enabled=${globalThis.autoSailing.settings.enabled} strategy=${globalThis.autoSailing.settings.strategy}`);
+
+// A storage layer that hands back JSON instead of an object must not silently degrade to
+// defaults (spreading a string yields numeric keys and every real setting stays default).
+store.set("settings", JSON.stringify({ ...conf, strategy: "safe" }));
+const fresh2 = await import("../mod/setup.mjs?restart=2");
+let f2Char, f2Iface;
+fresh2.setup({
+  settings: { section: () => ({ add() {}, set() {} }) },
+  characterStorage: ctx.characterStorage,
+  onCharacterLoaded: (f) => (f2Char = f),
+  onInterfaceReady: (f) => (f2Iface = f),
+});
+f2Char();
+f2Iface();
+check("a JSON-string payload is parsed, not spread into garbage",
+  globalThis.autoSailing.settings.strategy === "safe" &&
+    globalThis.autoSailing.settings.enabled === true,
+  `strategy=${globalThis.autoSailing.settings.strategy}`);
 
 // ===========================================================================
 console.log("");
