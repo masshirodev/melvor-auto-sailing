@@ -1,0 +1,42 @@
+<p><strong>Your ships never idle again.</strong> Auto Sailing collects the loot the moment a ship gets back, sends it straight out again, and can keep it pointed at the best port for whatever you're going for.</p>
+
+<p><em>Requires the <strong>Sailing</strong> mod.</em></p>
+
+<h3>Why you want it</h3>
+
+<p>A Sailing voyage takes <strong>distance &times; 60 seconds</strong> &mdash; an hour to Tiny Island, <strong>22 hours</strong> to King's Landing. And a ship that returns does <em>nothing at all</em> until you click <strong>Collect Loot</strong> and then <strong>Set Sail</strong> again. Every hour you don't notice is an hour that ship sat in port.</p>
+
+<h3>What it does</h3>
+
+<ul>
+  <li><strong>Auto set sail</strong> &mdash; re-dispatches any idle ship.</li>
+  <li><strong>Auto collect loot</strong> &mdash; collects the instant a ship returns, closing the loot popup for you.</li>
+  <li><strong>Auto upgrade tier</strong> &mdash; buys the next ship tier when you can afford it. <em>Off by default: spends up to 100M GP + materials.</em></li>
+  <li><strong>Auto buy ships</strong> &mdash; unlocks locked ships when you can afford them. <em>Off by default: spends up to 50M GP.</em></li>
+</ul>
+
+<h3>Port strategies</h3>
+
+<p>Set one globally, or override it per ship &mdash; so you can farm a guild port with one ship while another levels.</p>
+
+<ul>
+  <li><strong>Manual</strong> &mdash; never touches the port you picked. (Default.)</li>
+  <li><strong>Level up</strong> &mdash; always the furthest port you've unlocked.</li>
+  <li><strong>Best XP rate</strong> &mdash; maximises expected XP/hour, backing off to a nearer port when your cannon can't cover the combat check.</li>
+  <li><strong>Safe</strong> &mdash; the furthest port you can reach at 100% success. No pirate risk.</li>
+  <li><strong>Pinned port</strong> &mdash; one specific port, forever. This is how you farm a guild port.</li>
+</ul>
+
+<p><strong>Why "level up" is simply "go furthest":</strong> trip time scales with distance, but base XP scales with distance <em>squared</em> &mdash; so XP per hour comes out linear in distance. The furthest port you can reach is always the fastest to level on. There's no tradeoff to tune.</p>
+
+<p><strong>Why the other strategies exist:</strong> every port has a Combat requirement, and your success chance is your Combat divided by the port's. Fail the roll and <em>"you were attacked by pirates and lost half your loot"</em> &mdash; which halves the XP too. Combat comes from the cannons you buy in the shop, so a port that's technically unlocked can still be a bad deal. <strong>Best XP rate</strong> prices that risk in; <strong>Safe</strong> refuses to gamble.</p>
+
+<h3>Usage</h3>
+
+<p>Enable it alongside the Sailing mod and open the <strong>Sailing</strong> page &mdash; the control panel sits just under the XP bars, with a row per ship showing its status, port and time remaining. The master switch is also in the Mod Manager settings, so you can flip automation on and off without opening the page.</p>
+
+<p>Everything is <strong>off by default</strong>, and the two options that spend GP stay off until you turn them on. Nothing is bought that you couldn't have bought yourself: the mod runs the game's own affordability and level checks before it spends a coin.</p>
+
+<h3>Good to know</h3>
+
+<p>While the game is <strong>closed</strong> the mod isn't running, so a ship that returns three hours into an eight-hour absence still waits for you. It's collected and re-sailed the moment you load in, but the voyages that "would have" happened aren't invented for you &mdash; this automates your clicks, it doesn't fabricate rewards.</p>
