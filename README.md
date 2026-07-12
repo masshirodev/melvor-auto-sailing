@@ -97,6 +97,17 @@ Things worth knowing before changing this:
   graph at runtime. Paste them into the browser console (Melvor makes you type `allow pasting`
   once first).
 
+## Build
+
+```sh
+./build.sh              # syntax-check, run tests, package auto-sailing.zip
+./build.sh --skip-tests
+```
+
+`manifest.json` and `setup.mjs` must end up at the **root** of the archive (hence `zip -j`).
+A wrongly nested mod installs and enables without complaint and then never runs, so the
+script verifies the layout instead of trusting it.
+
 ## Tests
 
 ```sh
