@@ -56,6 +56,13 @@ archive root).
 **As a local mod:** create a local mod in the Melvor Mod Manager and point it at the `mod/`
 folder.
 
+> **Settings will not persist for an unlinked local mod.** Melvor's wiki says this of both Mod
+> Settings and character storage: *"When loading your mod as a Local Mod via the Creator Toolkit,
+> the mod must be linked to mod.io and you must have subscribed to and installed the mod via
+> mod.io in order for this data to persist."* Nothing is saved until you do — no amount of code
+> here can change that. The mod says so in the console at load; run `autoSailing.check()` to see
+> for yourself.
+
 Then enable it, along with the Sailing mod, and load a character.
 
 ## Development notes

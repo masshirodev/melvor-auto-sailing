@@ -20,7 +20,7 @@
 //     in that modal's didDestroy. So we let it run and close the modal for you, which puts
 //     the rewards through the game's own code path rather than reimplementing them.
 
-const VERSION = "0.1.2";
+const VERSION = "0.1.3";
 const TAG = `[Auto Sailing v${VERSION}]`;
 const MARK = "auto-sailing";
 
@@ -32,6 +32,7 @@ const LOCK = { LOCKED: 0, UNLOCKED: 1 };
 const LOOT_SIGNATURE = "Sailing Skill XP";
 
 const STORAGE_KEY = "settings";
+const STORAGE_LIMIT = 8192; // Melvor's per-mod character-storage cap
 const BACKSTOP_MS = 5_000;
 const DISMISS_POLL_MS = 200;
 
@@ -51,6 +52,8 @@ const DEFAULTS = {
   autoBuy: false,
   strategy: "manual",
   ships: {}, // localID -> { enabled, strategy: "inherit"|<mode>, pinnedPort: <port id|null> }
+
+  savedAt: 0, // stamped on every write; the only honest proof a write survived a reload
 };
 
 let settings = structuredClone(DEFAULTS);
@@ -118,7 +121,13 @@ function loadSettings() {
     }
     settings = { ...structuredClone(DEFAULTS), ...saved, ships: saved.ships ?? {} };
     settingsLoaded = true;
-    log("settings loaded", settings);
+
+    // The one thing that actually proves persistence works: settings we wrote in an earlier
+    // session came back. A canary round-trip can't tell you this — the store can work in memory
+    // and still be dropped when the character save is written, which is exactly what happens to
+    // a local mod that isn't linked to mod.io.
+    const age = settings.savedAt ? Math.round((Date.now() - settings.savedAt) / 1000) : null;
+    log(age === null ? "settings loaded" : `settings loaded (saved ${age}s ago)`, settings);
   } catch (err) {
     warn("could not load settings, using defaults", err);
   }
@@ -130,9 +139,22 @@ function saveSettings() {
     return;
   }
   try {
+    // Stamped so the next load can prove the write survived. See loadSettings().
+    settings.savedAt = Date.now();
+
     // Round-trip through JSON so we can never hand characterStorage something
     // unserialisable, and so what we store is exactly what we'll read back.
-    storage.setItem(STORAGE_KEY, JSON.parse(JSON.stringify(settings)));
+    const payload = JSON.parse(JSON.stringify(settings));
+
+    // Melvor gives each mod 8kb of character storage. Going over doesn't throw — it just
+    // doesn't save — so check before writing rather than wondering later.
+    const size = JSON.stringify(payload).length;
+    if (size > STORAGE_LIMIT) {
+      warn(`settings are ${size} bytes, over Melvor's ${STORAGE_LIMIT}-byte per-mod limit — not saved.`);
+      return;
+    }
+
+    storage.setItem(STORAGE_KEY, payload);
 
     // characterStorage is only written into the save file when the game next saves. Without
     // this, changing a setting and then reloading (or closing the tab) before the next
@@ -140,6 +162,40 @@ function saveSettings() {
     getGame()?.scheduleSave?.();
   } catch (err) {
     warn("could not save settings", err);
+  }
+}
+
+// Melvor's wiki, on both Mod Settings and character storage:
+//
+//   "When loading your mod as a Local Mod via the Creator Toolkit, the mod must be linked to
+//    mod.io and you must have subscribed to and installed the mod via mod.io in order for this
+//    data to persist."
+//
+// So a local mod that isn't linked to mod.io silently saves nothing, which looks exactly like a
+// bug in here. Round-trip a canary and say so plainly instead of leaving you to guess.
+function checkStorage() {
+  if (!storage?.setItem) {
+    warn("characterStorage is unavailable — settings cannot be saved this session.");
+    return false;
+  }
+  try {
+    const canary = `canary-${Date.now()}`;
+    storage.setItem("storage-check", canary);
+    const readBack = storage.getItem("storage-check");
+    storage.removeItem?.("storage-check");
+
+    if (readBack !== canary) {
+      warn(
+        "characterStorage did not read back what we wrote — settings will not persist. " +
+          "If this is a local mod, Melvor requires it to be linked to mod.io and installed from " +
+          "there before any mod data is saved.",
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    warn("characterStorage threw; settings will not persist", err);
+    return false;
   }
 }
 
@@ -442,7 +498,6 @@ function checkbox(key, label, hint) {
   input.addEventListener("change", () => {
     settings[key] = input.checked;
     saveSettings();
-    if (key === "enabled") syncSettingsSection();
     tickAll();
     updatePanel();
   });
@@ -649,57 +704,34 @@ function mountPanel(sailing) {
 }
 
 // ---------------------------------------------------------------------------
-// Settings section (so the master switch is reachable without opening Sailing)
+// There is deliberately NO ctx.settings section.
+//
+// There used to be a "Automation enabled" switch mirrored into the Mod Manager. That made
+// `enabled` live in two places at once: ctx.settings, which the mod loader persists
+// account-wide and restores on its own schedule, and characterStorage, which is per
+// character. The loader's restore fires the switch's onChange, which wrote its value
+// straight back over ours — so a per-character `enabled` could be clobbered by the
+// account-level default and then saved on top. Settings appeared not to persist.
+//
+// characterStorage is now the single source of truth, and the panel on the Sailing page is
+// the only UI. If a Mod Manager switch is wanted again, it must read/write the same store
+// rather than keep its own copy.
 // ---------------------------------------------------------------------------
-
-let settingsSection = null;
-
-function registerSettings(ctx) {
-  try {
-    settingsSection = ctx?.settings?.section?.("Auto Sailing");
-    settingsSection?.add?.({
-      type: "switch",
-      name: "enabled",
-      label: "Automation enabled",
-      hint: "Collect returning ships and re-dispatch them. Per-ship options live on the Sailing page.",
-      default: false,
-      onChange: (value) => {
-        settings.enabled = value;
-        saveSettings();
-        tickAll();
-        updatePanel();
-      },
-    });
-  } catch (err) {
-    warn("could not register settings section", err);
-  }
-}
-
-// This switch is account-wide but our settings are per-character, so push the loaded
-// character's value into it — otherwise it would show the previous character's state.
-function syncSettingsSection() {
-  try {
-    settingsSection?.set?.("enabled", settings.enabled);
-  } catch (err) {
-    warn("could not sync the settings switch", err);
-  }
-}
 
 // ---------------------------------------------------------------------------
 
 export function setup(ctx) {
-  // Grab the storage handle now, not inside onCharacterLoaded. The object exists from
-  // setup; only its *contents* need a loaded character. Deferring the assignment meant that
-  // if that hook didn't fire (a mod reloaded into an already-running game, say), every save
-  // silently no-opped.
+  // A fallback handle, so a mod reloaded into an already-running game (which never gets
+  // onCharacterLoaded) can still save. The real one comes from the lifecycle hook below: the
+  // wiki is explicit that character storage isn't available until a character has loaded, and
+  // every hook is handed the context to read it from.
   storage = ctx.characterStorage ?? null;
-  if (!storage) warn("ctx.characterStorage is unavailable; settings will not persist");
 
-  registerSettings(ctx);
-
-  ctx.onCharacterLoaded(() => {
+  ctx.onCharacterLoaded((loadedCtx) => {
+    storage = loadedCtx?.characterStorage ?? storage;
     loadSettings();
-    syncSettingsSection();
+    checkStorage();
+    updatePanel();
   });
 
   ctx.onInterfaceReady(() => {
@@ -712,8 +744,9 @@ export function setup(ctx) {
     // A mod reloaded into a running game misses onCharacterLoaded, so settings would still
     // be at their defaults here. Load them if that hook never ran.
     if (!settingsLoaded) {
+      storage = ctx.characterStorage ?? storage;
       loadSettings();
-      syncSettingsSection();
+      checkStorage();
     }
 
     injectStyles();
@@ -724,7 +757,16 @@ export function setup(ctx) {
       get settings() { return settings; },
       stored: () => storage?.getItem?.(STORAGE_KEY),
       save: () => saveSettings(),
-      dump() { console.log({ live: settings, stored: this.stored(), hasStorage: !!storage }); },
+      check: () => checkStorage(),
+      dump() {
+        console.log({
+          live: settings,
+          stored: this.stored(),
+          hasStorage: !!storage,
+          storageWorks: checkStorage(),
+          bytes: JSON.stringify(settings).length,
+        });
+      },
       reset() { settings = structuredClone(DEFAULTS); saveSettings(); updatePanel(); },
     };
 

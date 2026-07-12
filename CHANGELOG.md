@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.3 — One source of truth for settings
+
+- **Removed the Mod Manager settings switch.** `enabled` was living in two places at once:
+  `ctx.settings`, which the mod loader persists **account-wide** and restores on its own
+  schedule, and `characterStorage`, which is **per character**. The loader's restore fires the
+  switch's `onChange`, which wrote its value straight back over ours — so a per-character
+  `enabled` could be clobbered by the account-level default and then saved on top of the real
+  one. That is very likely why settings appeared not to persist even after 0.1.2.
+
+  `characterStorage` is now the single source of truth and the panel on the Sailing page is the
+  only UI. A Mod Manager switch can come back, but only if it reads and writes that same store
+  instead of keeping its own copy.
+
+- For reference: Sailing and Enchanting don't help here — both are *skill* mods that persist
+  through the skill's own `encode`/`decode` into the save file (that's the "Wrote N bytes for
+  Enchanting save" line). Enchanting destructures `characterStorage` and never uses it. They do
+  confirm `game.scheduleSave()` is the right call, which 0.1.2 added.
+
 ## 0.1.2 — Settings now actually persist
 
 - **Fixed settings not surviving a restart.** `characterStorage` is only written into the save
